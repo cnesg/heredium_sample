@@ -170,7 +170,79 @@ async function listSources(): Promise<ToolResult> {
   };
 }
 
+/**
+ * ARTREND 온톨로지(맥미니의 Ontological Studio). 사이트에서 직접 닿지 않으므로
+ * 맥미니의 gateway(Cloudflare Tunnel 뒤, Bearer 토큰)로 부른다. 읽기 전용이다.
+ */
+async function ontology(path: "/artist" | "/cypher", body: unknown): Promise<ToolResult> {
+  const base = process.env.ONTOLOGY_URL?.replace(/\/+$/, "");
+  const token = process.env.ONTOLOGY_TOKEN;
+  if (!base || !token) return { ok: false, reason: "온톨로지 연결 설정(ONTOLOGY_URL·ONTOLOGY_TOKEN)이 없습니다." };
+
+  const res = await fetch(base + path, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!res.ok) return { ok: false, reason: `온톨로지 서버 응답 ${res.status} — 맥미니가 꺼져 있을 수 있습니다.` };
+
+  const data = (await res.json()) as Record<string, unknown>;
+  if (data.error) return { ok: false, reason: String(data.error) };
+  if (data.found === false) return { ok: false, reason: String(data.reason) };
+  return { ok: true, data };
+}
+
+async function ontologyArtist(input: { name: string }): Promise<ToolResult> {
+  const name = (input.name ?? "").trim();
+  if (!name) return { ok: false, reason: "이름이 비어 있습니다." };
+  return ontology("/artist", { name });
+}
+
+async function ontologyQuery(input: { query: string; params?: Record<string, unknown> }): Promise<ToolResult> {
+  return ontology("/cypher", { query: input.query ?? "", params: input.params ?? {} });
+}
+
 export const TOOLS = [
+  {
+    name: "ontology_artist",
+    description:
+      "ARTREND 온톨로지에서 작가 한 명의 전체 기록을 가져온다. 프로필(위키데이터 기준 생몰년·국적·한글명), " +
+      "전시 이력(MoMA·국립현대미술관·퐁피두·주요 갤러리, 최근순), 최근 뉴스(세계 미술 매체·국내 언론, 최신순), 비엔날레 참여·수상, " +
+      "소장처, 전속 갤러리, 아트페어 출품, MoMA 소장 작품 수, 국내외 공개 경매 로트 집계를 한 번에 돌려준다. " +
+      "작가 이름이 나오는 질문에는 이 도구를 가장 먼저 쓴다. 한글·영문 이름 모두 된다.",
+    input_schema: {
+      type: "object" as const,
+      properties: { name: { type: "string", description: "작가 이름(한글 또는 영문, 예: 피카소, Haegue Yang)" } },
+      required: ["name"],
+    },
+    run: ontologyArtist,
+  },
+  {
+    name: "ontology_query",
+    description:
+      "ARTREND 온톨로지에 읽기 전용 Cypher를 직접 보낸다. ontology_artist로 답이 안 되는 질문(기관별 전시, 기간별 집계, " +
+      "여러 작가 비교 등)에만 쓴다. 결과는 최대 20행이라 ORDER BY·LIMIT·count()로 줄여서 묻는다. CALL {} 서브쿼리는 안 된다.\n" +
+      "노드: Artist(uid,name,aliases,birth_year,death_year,nationality,content), Event(name,start_date,end_date,year,kind=exhibition|collection_gallery|program|performance|film,url), " +
+      "Institution(name,kind,url,content), Article(name=제목,aliases=한글제목(일부),content=한글요약 또는 원문 발췌,start_date,url) — 세계 미술 매체·국내 언론 기사 2만여 건(2025~), " +
+      "BiennaleEdition(name,year), Person(name), Source(name), " +
+      "AuctionLot(house,sale_date,title,status,price,currency,price_basis,amount_usd,est_low,est_high), " +
+      "MomaArtwork(title,classification,date_acquired).\n" +
+      "관계: (Artist)-[:EXHIBITED_IN]->(Event)-[:HELD_AT]->(Institution), (Person)-[:CURATED]->(Event), " +
+      "(Artist)-[:PARTICIPATED_IN|WON_AWARD]->(BiennaleEdition), (Artist)-[:IN_COLLECTION_OF|REPRESENTED_BY]->(Institution), " +
+      "(Artist)-[:PRESENTED_BY]->(Institution), (Article)-[:MENTIONS]->(Artist|Institution), (Article)-[:PUBLISHED_BY]->(Institution), " +
+      "(AuctionLot)-[:OF_ARTIST]->(Artist), (MomaArtwork)-[:BY_ARTIST]->(Artist). " +
+      "날짜는 'YYYY-MM-DD' 문자열이라 문자열 비교로 거른다. 한글 이름은 toString(a.aliases) CONTAINS $n 으로 찾는다.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "읽기 전용 Cypher (MATCH/WHERE/WITH/RETURN)" },
+        params: { type: "object", description: "쿼리 파라미터 ($이름)" },
+      },
+      required: ["query"],
+    },
+    run: ontologyQuery,
+  },
   {
     name: "search_fairs",
     description:
@@ -239,6 +311,12 @@ export const SYSTEM_PROMPT = `당신은 ARTREND의 안내자다. ARTREND는 국�
 ## 답하는 방식
 - 반드시 한국어로, 짧고 단정하게 답한다. 서론 없이 바로 답부터 말한다.
 - 도구를 먼저 쓴다. 작가·페어·전시·시장 질문은 이 사이트가 실제 데이터를 갖고 있다.
+- 작가 질문은 ontology_artist를 먼저 쓴다. 프로필 → 최근 전시 → 최근 뉴스 → 비엔날레·소장·전속 → 경매 순서로
+  정리하고, 국내 경매 세부(낙찰가 중앙값·낙찰률)가 필요하면 lookup_artist를 함께 쓴다.
+- 영문 기사는 한국어로 옮겨 요약하고, 매체명과 날짜, 원문 링크를 함께 적는다.
+- 온톨로지 결과에 other_candidates가 있으면 동명이인일 수 있다고 짧게 알린다.
+- 연도만 있는 날짜는 연도만 말한다. 날짜를 지어내지 않는다. 값이 없으면 "기록 없음"이지 0이 아니다.
+- 경매는 보조 지표다. 가격을 작품의 예술적 가치처럼 말하지 않는다.
 - 도구가 데이터를 못 찾으면 웹 검색으로 보완한다. 어느 쪽에서 온 정보인지 밝힌다
   ("ARTREND 경매 데이터 기준" / "웹 검색 결과").
 - 숫자는 도구가 준 값을 그대로 쓴다. 어림하거나 계산해서 새 숫자를 만들지 않는다.

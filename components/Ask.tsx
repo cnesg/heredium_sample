@@ -13,6 +13,8 @@ const SUGGESTS = [
 ];
 
 const TOOL_LABEL: Record<string, string> = {
+  ontology_artist: "ARTREND 온톨로지",
+  ontology_query: "ARTREND 온톨로지",
   search_fairs: "페어 캘린더",
   lookup_artist: "작가 데이터",
   search_gallery_news: "갤러리 아카이브",
